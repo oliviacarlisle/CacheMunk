@@ -9,11 +9,14 @@ interface Config {
   maxEntrySize?: number;
   onCacheHit?: EventHandler;
   onCacheMiss?: EventHandler;
+  compression?: boolean;
 }
 // write cache in the functional style (creator function)
 // instead of class (OOP) syntax for stronger encapsulation
 export const configureCache = (options: Config) => {
   const { redis } = options;
+
+  const compression = options.compression === true ? true : false;
 
   // checks that redis passed in is an instance of Redis
   if (!(redis instanceof Redis)) {
@@ -27,40 +30,46 @@ export const configureCache = (options: Config) => {
   const maxEntrySize =
     options.maxEntrySize && options.maxEntrySize > 0 ? options.maxEntrySize : 5_000_000;
 
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
   const { onCacheHit, onCacheMiss } = options;
 
-  const calcExecTime = (start: bigint, end: bigint) => {
-    const diff = end - start;
-    return Number(diff) / 1_000_000; // convert nanoseconds to milliseconds
-  };
+  // function to convert nanoseconds to milliseconds
+  const calcExecTime = (start: bigint, end: bigint) => Number(end - start) / 1_000_000;
 
   // Function to add a query result to the cache
   async function set(
     queryKey: string,
-    data: string | Buffer,
-    dependencies: string[],
+    data: string,
+    dependencies?: string[],
     ttlInSeconds = defaultTtl, // default to 1 hour in seconds
   ): Promise<void> {
     // Capture initial timestamp for performance monitoring
     const start = process.hrtime.bigint();
 
-    // Convert data to binary Buffer if it is a string
-    const binaryData = typeof data === 'string' ? Buffer.from(data) : data;
+    let compressedData;
+    if (compression) {
+      // Convert data to binary Buffer
+      const binaryData = Buffer.from(data);
 
-    // check if binary Data exceeds maxEntrySize
-    if (binaryData.length > maxEntrySize) {
-      throw new Error('maxEntrySize exceeded');
+      // check if binary Data exceeds maxEntrySize
+      if (binaryData.length > maxEntrySize) {
+        throw new Error('maxEntrySize exceeded');
+      }
+
+      // Compress buffer to save bandwidth using snappy. To further compress buffer. ex: 10kb ->3 kb
+      compressedData = await compress(binaryData);
     }
 
-    // Compress buffer to save bandwidth using snappy. To further compress buffer. ex: 10kb ->3 kb
-    const compressedData = await compress(binaryData);
-
-    if (dependencies.length > 0) {
+    if (dependencies && dependencies.length > 0) {
       // Create a pipeline/transaction (ensure data integrity and consistency. If one fail, all fails)
       const pipeline = redis.multi();
 
       // Store the query result
-      pipeline.set(queryKey, compressedData, 'EX', ttlInSeconds);
+      if (compression && compressedData) {
+        pipeline.set(queryKey, compressedData, 'EX', ttlInSeconds);
+      } else {
+        pipeline.set(queryKey, data, 'EX', ttlInSeconds);
+      }
 
       // Track dependencies
       dependencies.forEach((dependency) => {
@@ -72,7 +81,11 @@ export const configureCache = (options: Config) => {
       // Execute the pipeline
       await pipeline.exec();
     } else {
-      await redis.set(queryKey, compressedData, 'EX', ttlInSeconds);
+      if (compression && compressedData) {
+        await redis.set(queryKey, compressedData, 'EX', ttlInSeconds);
+      } else {
+        await redis.set(queryKey, data, 'EX', ttlInSeconds);
+      }
     }
 
     // Capture final timestamp
@@ -86,37 +99,46 @@ export const configureCache = (options: Config) => {
     // Capture initial timestamp for performance monitoring
     const start = process.hrtime.bigint();
 
+    let data;
+    let bufferData: Buffer | null;
     // Retrieve the cached query result based on query key
     const startReq = process.hrtime.bigint();
-    const compressedData = await redis.getBuffer(queryKey);
+    if (compression) {
+      data = await redis.getBuffer(queryKey);
+    } else {
+      data = await redis.get(queryKey);
+    }
     const endReq = process.hrtime.bigint();
 
     // Handle cache miss
-    if (!compressedData) {
+    if (data === null) {
       // this is a cache miss
       // to do: log cache miss
       const end = process.hrtime.bigint();
-      if (onCacheMiss) onCacheMiss(queryKey, calcExecTime(start, end));
-      console.log(`cache miss in ${calcExecTime(start, end).toFixed(3)}`);
+      // if (onCacheMiss) onCacheMiss(queryKey, calcExecTime(start, end));
+      // console.log(`cache miss in ${calcExecTime(start, end).toFixed(3)}`);
       return null;
     }
 
     // Decompress result
-    const startSnappy = process.hrtime.bigint();
-    const binaryData = await uncompress(compressedData);
-    const endSnappy = process.hrtime.bigint();
+    if (data instanceof Buffer) {
+      const startSnappy = process.hrtime.bigint();
+      const binaryData = await uncompress(data);
+      const endSnappy = process.hrtime.bigint();
+      // Convert result to string
+      data = typeof binaryData === 'string' ? binaryData : binaryData.toString();
+    }
 
-    // Convert result to string
-    const data = binaryData.toString();
+    data;
 
     // Capture final timestamp
     const end = process.hrtime.bigint();
 
-    if (onCacheHit) onCacheHit(queryKey, calcExecTime(start, end));
-    console.log(`response from redis in ${calcExecTime(startReq, endReq).toFixed(3)}`);
-    console.log(`compressed data size ${compressedData.length / 1000} KB`);
-    console.log(`decompression in ${calcExecTime(startSnappy, endSnappy).toFixed(3)}`);
-    console.log(`cache hit in ${calcExecTime(start, end).toFixed(3)}`);
+    // if (onCacheHit) onCacheHit(queryKey, calcExecTime(start, end));
+    // console.log(`response from redis in ${calcExecTime(startReq, endReq).toFixed(3)}`);
+    // console.log(`compressed data size ${compressedData.length / 1000} KB`);
+    // console.log(`decompression in ${calcExecTime(startSnappy, endSnappy).toFixed(3)}`);
+    // console.log(`cache hit in ${calcExecTime(start, end).toFixed(3)}`);
     return data;
   }
 
