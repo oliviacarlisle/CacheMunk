@@ -13,14 +13,16 @@ const delay = 1000 / Math.min(requestsPerSecond, 1000);
 interface fakeData {
   someRandomData: string;
   someOtherData: string;
+  someOtherKey: string;
 }
 
 // generating array of fake semi-random data
 const arr: fakeData[] = [];
-for (let i = 0; i < 500; i++) {
+for (let i = 0; i < 1_000; i++) {
   arr.push({
     someRandomData: nanoid(),
     someOtherData: nanoid(),
+    someOtherKey: 'someOtherSharedValue',
   });
 }
 
